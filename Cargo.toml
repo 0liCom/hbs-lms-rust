@@ -25,7 +25,6 @@ sha3 = { version = "0.10.0", default-features = false }
 crossbeam = {version = "0.8", optional = true }
 rand = { version = "0.8.3", optional = true }
 
-
 [dev-dependencies]
 clap = "3.0.0"
 tempfile = "3.2.0"
@@ -37,3 +36,8 @@ default = []
 std = []
 fast_verify = ["std", "rand", "crossbeam"]
 verbose = []
+
+[lib]
+name = "hbs_lms"
+# crate-type = ["cdylib"]      # Creates dynamic lib
+crate-type = ["staticlib"] # Creates static lib

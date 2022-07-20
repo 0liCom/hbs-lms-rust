@@ -15,6 +15,9 @@ clean:
 riscv:
 	cargo build --target riscv32imac-unknown-none-elf
 
+cortex_m4:
+	cargo build --release --target thumbv7em-none-eabihf
+
 check-for-todos:
 	@git grep -n -i -e todo -e fixme -- \
 	    :^Makefile \

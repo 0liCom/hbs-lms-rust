@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+//#![forbid(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 //! This library implements the Leighton-Micali-Signature scheme, as defined in the
@@ -117,9 +117,14 @@ pub use crate::hss::hss_verify as verify;
 pub use crate::hss::{SigningKey, VerifyingKey};
 
 use core::convert::TryFrom;
-use signature::Error;
+use core::mem::size_of;
+use core::panic::PanicInfo;
+use core::ptr;
+use core::slice;
+use signature::{Error, Verifier};
 use tinyvec::ArrayVec;
 
+use crate::constants::{MAX_HSS_PUBLIC_KEY_LENGTH, REF_IMPL_MAX_PRIVATE_KEY_SIZE};
 use constants::MAX_HSS_SIGNATURE_LENGTH;
 
 /**
@@ -183,6 +188,239 @@ impl<'a> signature::Signature for VerifierSignature<'a> {
         Err(Error::new())
     }
 }
+
+/*
+ * BEGIN C BINDINGS
+ */
+
+// Types used for extern C
+
+// Change this for different hash functions
+type Hasher = Sha256_256;
+
+#[allow(non_camel_case_types)]
+type c_int = i32;
+#[allow(non_camel_case_types)]
+type c_char = i8;
+
+extern "C" {
+    /// Prints out `msg`
+    pub fn hal_send_str(msg: *const c_char);
+    /// Writes `len` random bytes to `dest`
+    pub fn randombytes(dest: *const u8, len: usize);
+}
+
+#[no_mangle]
+pub extern "C" fn do_crypto_sign_keypair(pk: *mut u8, sk: *mut u8) -> c_int {
+    let seed = Seed::default();
+
+    // random seed
+    unsafe { randombytes(seed.as_slice().as_ptr(), seed.len()) }
+
+    // fixed seed
+    // let seed_values: [u8; MAX_SEED_LEN] = [
+    //     125, 43, 194, 148, 228, 228, 109, 53, 178, 168, 154, 26, 105, 33, 56, 139, 144, 32, 20, 157,
+    //     252, 187, 167, 93, 172, 133, 194, 255, 194, 100, 197, 225,
+    // ];
+    // seed.as_mut_slice()
+    //     .copy_from_slice(&seed_values[..(Hasher::OUTPUT_SIZE as usize)]);
+
+    let (signing_key, verifying_key) =
+        match keygen::<Hasher>(&[HssParameter::construct_default_parameters()], &seed, None) {
+            Ok(keypair) => keypair,
+            Err(_) => {
+                return -1;
+            }
+        };
+
+    unsafe {
+        ptr::copy(signing_key.bytes.as_ptr(), sk, signing_key.bytes.len());
+        ptr::copy(verifying_key.bytes.as_ptr(), pk, verifying_key.bytes.len());
+    }
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn do_crypto_sign(
+    sm: *mut u8,
+    smlen: *mut usize,
+    m: *const u8,
+    mlen: usize,
+    sk: *const u8,
+) -> c_int {
+    let msg = unsafe { slice::from_raw_parts(m, mlen) };
+
+    let mut signing_key = SigningKey::<Hasher>::from_bytes(unsafe {
+        slice::from_raw_parts(sk, REF_IMPL_MAX_PRIVATE_KEY_SIZE)
+    })
+    .unwrap();
+
+    let signing_key_const = signing_key.clone();
+
+    let mut update_private_key = |new_key: &[u8]| {
+        signing_key.as_mut_slice().copy_from_slice(new_key);
+        Ok(())
+    };
+
+    let signature = match sign::<Hasher>(
+        &msg,
+        signing_key_const.as_slice(),
+        &mut update_private_key,
+        None,
+    ) {
+        Ok(signature) => signature,
+        Err(_) => return -1,
+    };
+
+    let sig_len = signature.bytes.len();
+
+    unsafe {
+        smlen.write(size_of::<u32>() + msg.len() + sig_len);
+        sm.cast::<u32>().write(signature.bytes.len() as u32);
+        ptr::copy_nonoverlapping(
+            msg.as_ptr(),
+            sm.offset(size_of::<u32>() as isize),
+            msg.len(),
+        );
+        ptr::copy_nonoverlapping(
+            signature.bytes.as_ptr(),
+            sm.offset((size_of::<u32>() + msg.len()) as isize),
+            sig_len,
+        );
+    }
+
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn do_crypto_sign_open(
+    m: *mut u8,
+    mlen: *mut usize,
+    sm: *const u8,
+    smlen: usize,
+    pk: *const u8,
+) -> c_int {
+    if smlen < size_of::<u32>() {
+        return -1;
+    }
+
+    let sig_len = unsafe { sm.cast::<u32>().read() as usize };
+    if smlen < sig_len {
+        return -1;
+    }
+
+    let msg_len = smlen - size_of::<u32>() - sig_len;
+    if smlen < sig_len + msg_len + size_of::<u32>() {
+        return -1;
+    }
+    unsafe {
+        mlen.write(msg_len);
+    }
+    let msg =
+        unsafe { slice::from_raw_parts_mut(m.offset(size_of::<u32>() as isize), msg_len) };
+
+    let verifying_key = VerifyingKey::<Hasher>::from_bytes(unsafe {
+        slice::from_raw_parts(pk, MAX_HSS_PUBLIC_KEY_LENGTH)
+    })
+    .unwrap();
+
+    let signature = Signature::from_bytes_verbose(
+        unsafe { slice::from_raw_parts(sm.offset((size_of::<u32>() + msg_len) as isize), sig_len) },
+        0,
+    )
+    .unwrap();
+
+    // print key
+    /*
+    let mut keyout = [0x20u8; 48 * 3];
+    keyout[143] = 0;
+    for i in 0..48 {
+        keyout[3 * i] = (signature.bytes[i] >> 4) + 0x30u8;
+        keyout[3 * i + 1] = (signature.bytes[i] & 0xf) + 0x30u8;
+    }
+    unsafe {
+        hal_send_str( keyout.as_ptr().cast());
+    }
+     */
+
+    match verifying_key.verify(msg, &signature) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn do_crypto_sign_signature(
+    _sig: *mut u8,
+    _siglen: *mut usize,
+    _m: *const u8,
+    _mlen: usize,
+    _sk: *const u8,
+) -> c_int {
+    unimplemented!()
+}
+
+#[no_mangle]
+pub extern "C" fn do_crypto_sign_verify(
+    sig: *const u8,
+    siglen: usize,
+    m: *const u8,
+    mlen: usize,
+    pk: *const u8,
+) -> c_int {
+    let msg = unsafe { slice::from_raw_parts(m, mlen) };
+
+    let verifying_key = VerifyingKey::<Hasher>::from_bytes(unsafe {
+        slice::from_raw_parts(pk, MAX_HSS_PUBLIC_KEY_LENGTH)
+    })
+    .unwrap();
+
+    let signature =
+        Signature::from_bytes_verbose(unsafe { slice::from_raw_parts(sig, siglen) }, 0).unwrap();
+
+    // print key
+    /*
+    let mut keyout = [0x20u8; 48 * 3];
+    keyout[143] = 0;
+    for i in 0..48 {
+        keyout[3 * i] = (signature.bytes[i] >> 4) + 0x30u8;
+        keyout[3 * i + 1] = (signature.bytes[i] & 0xf) + 0x30u8;
+    }
+    unsafe {
+        hal_send_str( keyout.as_ptr().cast());
+    }
+     */
+
+    match verifying_key.verify(msg, &signature) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[panic_handler]
+pub fn panic(reason: &PanicInfo) -> ! {
+    unsafe {
+        let out = [112, 97, 110, 105, 99, 0x00];
+        hal_send_str(out.as_ptr());
+    }
+
+    if let Some(msg) = reason.payload().downcast_ref::<&str>() {
+        unsafe {
+            hal_send_str(msg.as_bytes().as_ptr().cast());
+        }
+    } else {
+        unsafe {
+            let out = [32, 98, 117, 116, 32, 119, 104, 121, 0];
+            hal_send_str(out.as_ptr());
+        }
+    }
+
+    loop {}
+}
+
+/*
+ * END C BINDINGS
+ */
 
 #[cfg(test)]
 mod tests {
