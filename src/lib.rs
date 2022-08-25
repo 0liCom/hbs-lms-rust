@@ -195,8 +195,9 @@ impl<'a> signature::Signature for VerifierSignature<'a> {
 
 // Types used for extern C
 
-// Change this for different hash functions
-type Hasher = Sha256_256;
+// Change these for different hash functions
+type Hasher = Sha256_128;
+const PRIVATE_KEY_SIZE: usize = 32; // 48 for 256, 40 for 192, 32 for 128
 
 #[allow(non_camel_case_types)]
 type c_int = i32;
@@ -233,6 +234,19 @@ pub extern "C" fn do_crypto_sign_keypair(pk: *mut u8, sk: *mut u8) -> c_int {
             }
         };
 
+    // unsafe {
+    //     hal_send_str("signing_key len:\0".as_bytes().as_ptr().cast());
+    //     let keylen = signing_key.bytes.len();
+    //     let keylenout = [
+    //         ((keylen / 1000) % 10) as u8 + 0x30,
+    //         ((keylen / 100) % 10) as u8 + 0x30,
+    //         ((keylen / 10) % 10) as u8 + 0x30,
+    //         (keylen % 10) as u8 + 0x30,
+    //         0u8,
+    //     ];
+    //     hal_send_str( keylenout.as_ptr().cast());
+    // }
+
     unsafe {
         ptr::copy(signing_key.bytes.as_ptr(), sk, signing_key.bytes.len());
         ptr::copy(verifying_key.bytes.as_ptr(), pk, verifying_key.bytes.len());
@@ -251,7 +265,7 @@ pub extern "C" fn do_crypto_sign(
     let msg = unsafe { slice::from_raw_parts(m, mlen) };
 
     let mut signing_key = SigningKey::<Hasher>::from_bytes(unsafe {
-        slice::from_raw_parts(sk, REF_IMPL_MAX_PRIVATE_KEY_SIZE)
+        slice::from_raw_parts(sk, PRIVATE_KEY_SIZE)
     })
     .unwrap();
 
@@ -402,6 +416,7 @@ pub fn panic(reason: &PanicInfo) -> ! {
     unsafe {
         let out = [112, 97, 110, 105, 99, 0x00];
         hal_send_str(out.as_ptr());
+        hal_send_str("real panic\0".as_bytes().as_ptr().cast());
     }
 
     if let Some(msg) = reason.payload().downcast_ref::<&str>() {
